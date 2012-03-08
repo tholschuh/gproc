@@ -30,6 +30,7 @@
          set_value/2,
          give_away/2,
          update_counter/2,
+	 update_counters/1,
 	 update_shared_counter/2,
 	 reset_counter/1]).
 
@@ -53,6 +54,7 @@
          code_change/4,
          terminate/2]).
 
+-include("gproc_int.hrl").
 -include("gproc.hrl").
 
 -define(SERVER, ?MODULE).
@@ -98,45 +100,45 @@ reg({_,g,_} = Key, Value) ->
     %% anything global
     leader_call({reg, Key, Value, self()});
 reg(_, _) ->
-    erlang:error(badarg).
+    ?THROW_GPROC_ERROR(badarg).
 
 reg_shared({_,g,_} = Key, Value) ->
     leader_call({reg, Key, Value, shared});
 reg_shared(_, _) ->
-    erlang:error(badarg).
+    ?THROW_GPROC_ERROR(badarg).
 
 
 mreg(T, KVL) ->
     if is_list(KVL) -> leader_call({mreg, T, g, KVL, self()});
-       true -> erlang:error(badarg)
+       true -> ?THROW_GPROC_ERROR(badarg)
     end.
 
 munreg(T, Keys) ->
     if is_list(Keys) -> leader_call({munreg, T, g, Keys, self()});
-       true -> erlang:error(badarg)
+       true -> ?THROW_GPROC_ERROR(badarg)
     end.
 
 unreg({_,g,_} = Key) ->
     leader_call({unreg, Key, self()});
 unreg(_) ->
-    erlang:error(badarg).
+    ?THROW_GPROC_ERROR(badarg).
 
 unreg_shared({T,g,_} = Key) when T==c; T==a ->
     leader_call({unreg, Key, shared});
 unreg_shared(_) ->
-    erlang:error(badarg).
+    ?THROW_GPROC_ERROR(badarg).
 
 
 set_value({T,g,_} = Key, Value) when T==a; T==c ->
     if is_integer(Value) ->
             leader_call({set, Key, Value});
        true ->
-            erlang:error(badarg)
+            ?THROW_GPROC_ERROR(badarg)
     end;
 set_value({_,g,_} = Key, Value) ->
     leader_call({set, Key, Value, self()});
 set_value(_, _) ->
-    erlang:error(badarg).
+    ?THROW_GPROC_ERROR(badarg).
 
 give_away({_,g,_} = Key, To) ->
     leader_call({give_away, Key, To, self()}).
@@ -145,18 +147,23 @@ give_away({_,g,_} = Key, To) ->
 update_counter({c,g,_} = Key, Incr) when is_integer(Incr) ->
     leader_call({update_counter, Key, Incr, self()});
 update_counter(_, _) ->
-    erlang:error(badarg).
+    ?THROW_GPROC_ERROR(badarg).
+
+update_counters(List) when is_list(List) ->
+    leader_call({update_counters, List});
+update_counters(_) ->
+    ?THROW_GPROC_ERROR(badarg).
 
 update_shared_counter({c,g,_} = Key, Incr) when is_integer(Incr) ->
     leader_call({update_counter, Key, Incr, shared});
 update_shared_counter(_, _) ->
-    erlang:error(badarg).
+    ?THROW_GPROC_ERROR(badarg).
 
 
 reset_counter({c,g,_} = Key) ->
     leader_call({reset_counter, Key, self()});
 reset_counter(_) ->
-    erlang:error(badarg).
+    ?THROW_GPROC_ERROR(badarg).
 
 
 %% @spec sync() -> true
@@ -320,6 +327,13 @@ handle_leader_call({update_counter, {c,g,_Ctr} = Key, Incr, Pid}, _From, S, _E)
     catch
         error:_ ->
             {reply, badarg, S}
+    end;
+handle_leader_call({update_counters, Cs}, _From, S, _E) ->
+    try  {Replies, Vals} = batch_update_counters(Cs),
+	 {reply, Replies, [{insert, Vals}], S}
+    catch
+	error:_ ->
+	    {reply, badarg, S}
     end;
 handle_leader_call({reset_counter, {c,g,_Ctr} = Key, Pid}, _From, S, _E) ->
     try  Current = ets:lookup_element(?TAB, {Key, Pid}, 3),
@@ -518,12 +532,12 @@ process_globals(Globals) ->
 
 remove_rev_entry(Pid, {T,g,_} = K, Event) when T==n; T==a ->
     Key = {Pid, K},
-    case ets:lookup(?TAB, Key) of
-	[]       -> ok;
-	[{_, r}] -> ok;
-	[{_, Opts}] when is_list(Opts) ->
-	    gproc_lib:notify(Event, K, Opts)
-    end,
+    _ = case ets:lookup(?TAB, Key) of
+	    []       -> ok;
+	    [{_, r}] -> ok;
+	    [{_, Opts}] when is_list(Opts) ->
+		gproc_lib:notify(Event, K, Opts)
+	end,
     ets:delete(?TAB, Key);
 remove_rev_entry(Pid, K, _Event) ->
     ets:delete(?TAB, {Pid, K}).
@@ -578,7 +592,7 @@ ets_key(K, Pid) ->
 
 leader_call(Req) ->
     case gen_leader:leader_call(?MODULE, Req) of
-        badarg -> erlang:error(badarg, Req);
+        badarg -> ?THROW_GPROC_ERROR(badarg);
         Reply  -> Reply
     end.
 
@@ -633,15 +647,73 @@ surrendered_1(Globs) ->
             leader_cast({remove_globals, Remove})
     end.
 
-update_aggr_counter({c,g,Ctr}, Incr) ->
+batch_update_counters(Cs) ->
+    batch_update_counters(Cs, [], []).
+
+batch_update_counters([{{c,g,_} = Key, Pid, Incr}|T], Returns, Updates) ->
+    case update_counter_g(Key, Incr, Pid) of
+	[{_,_,_} = A, {_, _, V} = C] ->
+	    batch_update_counters(T, [{Key,Pid,V}|Returns], add_object(
+							      A, add_object(C, Updates)));
+	[{_, _, V} = C] ->
+	    batch_update_counters(T, [{Key,Pid,V}|Returns], add_object(C, Updates))
+    end;
+batch_update_counters([], Returns, Updates) ->
+    {lists:reverse(Returns), Updates}.
+
+
+add_object({K,P,_} = Obj, [{K,P,_} | T]) ->
+    [Obj | T];
+add_object(Obj, [H|T]) ->
+    [H | add_object(Obj, T)];
+add_object(Obj, []) ->
+    [Obj].
+
+
+
+update_counter_g({c,g,_} = Key, Incr, Pid) when is_integer(Incr) ->
+    Res = ets:update_counter(?TAB, {Key, Pid}, {3,Incr}),
+    update_aggr_counter(Key, Incr, [{{Key,Pid},Pid,Res}]);
+update_counter_g({c,g,_} = Key, {Incr, Threshold, SetValue}, Pid)
+  when is_integer(Incr), is_integer(Threshold), is_integer(SetValue) ->
+    [Prev, New] = ets:update_counter(?TAB, {Key, Pid},
+				     [{3, 0}, {3, Incr, Threshold, SetValue}]),
+    update_aggr_counter(Key, New - Prev, [{{Key,Pid},Pid,New}]);
+update_counter_g({c,l,_} = Key, Ops, Pid) when is_list(Ops) ->
+    case ets:update_counter(?TAB, {Key, Pid},
+			    [{3, 0} | expand_ops(Ops)]) of
+	[_] ->
+	    [];
+	[Prev | Rest] ->
+	    [New | _] = lists:reverse(Rest),
+	    update_aggr_counter(Key, New - Prev, [{Key, Pid, Rest}])
+    end;
+update_counter_g(_, _, _) ->
+    ?THROW_GPROC_ERROR(badarg).
+
+
+expand_ops([{Incr,Thr,SetV}|T])
+  when is_integer(Incr), is_integer(Thr), is_integer(SetV) ->
+    [{3, Incr, Thr, SetV}|expand_ops(T)];
+expand_ops([Incr|T]) when is_integer(Incr) ->
+    [{3, Incr}|expand_ops(T)];
+expand_ops([]) ->
+    [];
+expand_ops(_) ->
+    ?THROW_GPROC_ERROR(badarg).
+
+update_aggr_counter(Key, Incr) ->
+    update_aggr_counter(Key, Incr, []).
+
+update_aggr_counter({c,g,Ctr}, Incr, Acc) ->
     Key = {{a,g,Ctr},a},
     case ets:lookup(?TAB, Key) of
         [] ->
-            [];
+            Acc;
         [{K, Pid, Prev}] ->
             New = {K, Pid, Prev+Incr},
             ets:insert(?TAB, New),
-            [New]
+            [New|Acc]
     end.
 
 pid_to_give_away_to(P) when is_pid(P) ->

@@ -75,11 +75,15 @@ reg_test_() ->
       , ?_test(t_is_clean())
       , {spawn, ?_test(?debugVal(t_simple_aggr_counter()))}
       , ?_test(t_is_clean())
+      , {spawn, ?_test(?debugVal(t_update_counters()))}
+      , ?_test(t_is_clean())
       , {spawn, ?_test(?debugVal(t_simple_prop()))}
       , ?_test(t_is_clean())
       , {spawn, ?_test(?debugVal(t_await()))}
       , ?_test(t_is_clean())
       , {spawn, ?_test(?debugVal(t_await_self()))}
+      , ?_test(t_is_clean())
+      , {spawn, ?_test(?debugVal(t_await_crash()))}
       , ?_test(t_is_clean())
       , {spawn, ?_test(?debugVal(t_simple_mreg()))}
       , ?_test(t_is_clean())
@@ -117,6 +121,8 @@ reg_test_() ->
       , ?_test(t_is_clean())
       , {spawn, ?_test(?debugVal(t_subscribe()))}
       , ?_test(t_is_clean())
+      , {spawn, ?_test(?debugVal(t_gproc_info()))}
+      , ?_test(t_is_clean())
      ]}.
 
 t_simple_reg() ->
@@ -147,6 +153,32 @@ t_simple_aggr_counter() ->
     ?assert(gproc:get_value({a,l,c1}) =:= 8),
     ?assert(gproc:update_counter({c,l,c1}, 4) =:= 7),
     ?assert(gproc:get_value({a,l,c1}) =:= 12),
+    P1 ! {self(), goodbye},
+    R = erlang:monitor(process, P1),
+    receive {'DOWN', R, _, _, _} ->
+	    gproc:audit_process(P1)
+    end,
+    ?assert(gproc:get_value({a,l,c1}) =:= 7).
+
+t_update_counters() ->
+    ?assert(gproc:reg({c,l,c1}, 3) =:= true),
+    ?assert(gproc:reg({a,l,c1}) =:= true),
+    ?assert(gproc:get_value({a,l,c1}) =:= 3),
+    P = self(),
+    P1 = spawn_link(fun() ->
+			    gproc:reg({c,l,c1}, 5),
+			    P ! {self(), ok},
+			    receive
+				{P, goodbye} -> ok
+			    end
+		    end),
+    receive {P1, ok} -> ok end,
+    ?assert(gproc:get_value({a,l,c1}) =:= 8),
+    Me = self(),
+    ?assertEqual([{{c,l,c1},Me,7},
+		  {{c,l,c1},P1,8}], gproc:update_counters(l, [{{c,l,c1}, Me, 4},
+							      {{c,l,c1}, P1, 3}])),
+    ?assert(gproc:get_value({a,l,c1}) =:= 15),
     P1 ! {self(), goodbye},
     R = erlang:monitor(process, P1),
     receive {'DOWN', R, _, _, _} ->
@@ -198,6 +230,23 @@ t_await_self() ->
 		       after 10000 ->
 			       timeout
 		       end).
+
+t_await_crash() ->
+    Name = {n,l,{dummy,?LINE}},
+    {Pid,_} = spawn_regger(Name),
+    ?assertEqual({Pid,undefined}, gproc:await(Name, 1000)),
+    exit(Pid, kill),
+    {NewPid,MRef} = spawn_regger(Name),
+    ?assertEqual(false, is_process_alive(Pid)),
+    ?assertEqual({NewPid,undefined}, gproc:await(Name, 1000)),
+    exit(NewPid, kill),
+    receive {'DOWN', MRef, _, _, _} -> ok end.
+
+spawn_regger(Name) ->
+    spawn_monitor(fun() ->
+			  gproc:reg(Name),
+			  timer:sleep(60000)
+		  end).
 
 t_is_clean() ->
     sys:get_status(gproc), % in order to synch
@@ -463,6 +512,40 @@ t_get_env_inherit() ->
     ?assertEqual(bar, gproc:get_env(l, gproc, foo,
 				    [{inherit, {n,l,get_env_p}}])),
     ?assertEqual(ok, t_call(P, die)).
+
+%% What we test here is that we return the same current_function as the
+%% process_info() BIF. As we parse the backtrace dump, we check with some
+%% weirdly named functions.
+t_gproc_info() ->
+    {A,B} = '-t1-'(),
+    ?assertEqual(A,B),
+    {C,D} = '\'t2'(),
+    ?assertEqual(C,D),
+    {E,F} = '\'t3\''(),
+    ?assertEqual(E,F),
+    {G,H} = t4(),
+    ?assertEqual(G,H).
+
+'-t1-'() ->
+    {_, I0} = process_info(self(), current_function),
+    {_, I} = gproc:info(self(), current_function),
+    {I0, I}.
+
+'\'t2'() ->
+    {_, I0} = process_info(self(), current_function),
+    {_, I} = gproc:info(self(), current_function),
+    {I0, I}.
+
+'\'t3\''() ->
+    {_, I0} = process_info(self(), current_function),
+    {_, I} = gproc:info(self(), current_function),
+    {I0, I}.
+
+
+t4() ->
+    {_, I0} = process_info(self(), current_function),
+    {_, I} = gproc:info(self(), current_function),
+    {I0, I}.
 
 t_monitor() ->
     Me = self(),
